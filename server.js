@@ -5,6 +5,8 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const { Readable } = require('stream');
+const { once } = require('events');
 
 // ============ CONFIGURATION ============
 const config = {
@@ -15,6 +17,11 @@ const config = {
     device_id_2: '',
     stb_type: 'MAG250',
     api_signature: '263',
+    // Optional: set a secret and use /playlist.m3u8?key=YOURSECRET so others can't use your link.
+    secret_key: '',
+    // false = redirect the player to the stream server (fine when the player is on the same network as this server).
+    // true  = this server fetches the video and relays it (needed when stream links are tied to the server's IP).
+    proxy_streams: false,
 };
 const PORT = process.env.PORT || 8080;
 const TOKEN_TTL_MS = 5 * 60 * 1000;
@@ -122,6 +129,57 @@ async function genToken() {
     return cached;
 }
 
+const keyParam = () => (config.secret_key ? `&key=${encodeURIComponent(config.secret_key)}` : '');
+const relaySecret = () => config.secret_key || md5(config.serial_number + config.device_id + config.mac_address);
+const sign = u => crypto.createHmac('sha256', relaySecret()).update(u).digest('hex');
+const relayLink = (origin, u) => `${origin}/relay?p=${Buffer.from(u).toString('base64url')}&sig=${sign(u)}${keyParam()}`;
+
+function rewriteHls(body, baseUrl, origin) {
+    const abs = r => { try { return new URL(r, baseUrl).toString(); } catch { return r; } };
+    return body.split(/\r\n|\r|\n/).map(line => {
+        const t = line.trim();
+        if (!t) return line;
+        if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, u) => `URI="${relayLink(origin, abs(u))}"`);
+        return relayLink(origin, abs(t));
+    }).join('\n');
+}
+
+// Fetch `target` from this server and pass it on. HLS playlists are rewritten so segments
+// also come through here; anything else is streamed straight through.
+async function relay(res, target, origin) {
+    const ac = new AbortController();
+    res.on('close', () => ac.abort());
+    try {
+        const up = await fetch(target, { headers: getHeaders(), redirect: 'follow', signal: ac.signal });
+        const ctype = up.headers.get('content-type') || '';
+        if (!up.body) return send(res, up.status, '');
+        const reader = up.body.getReader();
+        const first = await reader.read();
+        const head = first.value ? Buffer.from(first.value.subarray(0, 7)).toString() : '';
+        const isHls = /mpegurl/i.test(ctype) || /\.m3u8($|\?)/i.test(up.url) || head === '#EXTM3U';
+        if (isHls && up.ok) {
+            const chunks = first.value ? [Buffer.from(first.value)] : [];
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(Buffer.from(value));
+            }
+            return send(res, 200, rewriteHls(Buffer.concat(chunks).toString('utf8'), up.url, origin), 'application/vnd.apple.mpegurl');
+        }
+        res.writeHead(up.status, { 'Content-Type': ctype || 'application/octet-stream', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+        if (first.value) res.write(first.value);
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!res.write(value)) await once(res, 'drain');
+        }
+        res.end();
+    } catch (e) {
+        if (!res.headersSent) send(res, 502, `Stream fetch error: ${e.message}`);
+        else res.end();
+    }
+}
+
 const clean = s => String(s ?? '').replace(/"/g, "'").replace(/[\r\n]+/g, ' ').trim();
 
 function infoEntry(name, value) {
@@ -151,7 +209,7 @@ function buildM3U(channels, profile, account_info, origin, clientIp) {
         const encoded = Buffer.from(ch.cmd, 'utf8').toString('base64url');
         const logo = ch.logo ? `${base()}/misc/logos/320/${ch.logo}` : '';
         m3u.push(`#EXTINF:-1 tvg-id="${clean(ch.tvgid)}" tvg-name="${clean(ch.name)}" tvg-logo="${logo}" group-title="${clean(ch.title)}",${clean(ch.name)}`);
-        m3u.push(`${origin}/stream/${encoded}.m3u8`);
+        m3u.push(`${origin}/stream/${encoded}.m3u8${config.secret_key ? '?key=' + encodeURIComponent(config.secret_key) : ''}`);
     }
     return m3u.join('\n');
 }
@@ -165,7 +223,22 @@ async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const isPlaylist = url.pathname === '/playlist.m3u8';
     const streamMatch = url.pathname.match(/^\/stream\/([^/]+)\.m3u8$/);
-    if (!isPlaylist && !streamMatch) return send(res, 404, 'Not Found');
+    const isRelay = url.pathname === '/relay';
+    if (!isPlaylist && !streamMatch && !isRelay) return send(res, 404, 'Not Found');
+
+    if (config.secret_key && url.searchParams.get('key') !== config.secret_key) return send(res, 403, 'Forbidden');
+    const origin = `http://${req.headers.host}`;
+
+    if (isRelay) {
+        let target = '';
+        try { target = Buffer.from(url.searchParams.get('p') || '', 'base64url').toString('utf8'); } catch {}
+        const given = Buffer.from(url.searchParams.get('sig') || '');
+        const want = Buffer.from(target ? sign(target) : '');
+        if (!/^https?:\/\//i.test(target) || given.length !== want.length || !crypto.timingSafeEqual(given, want)) {
+            return send(res, 403, 'Invalid relay link');
+        }
+        return relay(res, target, origin);
+    }
 
     const { token, profile, account_info } = await genToken();
     if (!token) return send(res, 500, `Token generation failed. Reason: ${lastError || 'empty token in portal reply'}`);
@@ -187,7 +260,6 @@ async function handle(req, res) {
             logo: i.logo || '',
             title: groupMap[i.tv_genre_id] || 'Other',
         }));
-        const origin = `http://${req.headers.host}`;
         const clientIp = req.socket.remoteAddress || 'Unknown';
         return send(res, 200, buildM3U(channels, profile, account_info, origin, clientIp), 'application/vnd.apple.mpegurl');
     }
@@ -203,6 +275,7 @@ async function handle(req, res) {
         cached.token = '';
         return send(res, 502, `No stream URL received. ${lastError}`);
     }
+    if (config.proxy_streams) return relay(res, stream, origin);
     res.writeHead(302, { Location: stream });
     res.end();
 }
