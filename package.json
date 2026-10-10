@@ -1,0 +1,13 @@
+{
+  "name": "stalker-m3u-server",
+  "version": "1.0.0",
+  "description": "Serves an M3U playlist generated from a Stalker portal",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
