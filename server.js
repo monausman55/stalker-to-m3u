@@ -9,10 +9,10 @@ const crypto = require('crypto');
 // ============ CONFIGURATION ============
 const config = {
     host: 'watch.doordarshan.cc', // hostname only, no http:// and no path
-    mac_address: '00:1A:79:82:5F:01',
-    serial_number: '8B910A07977CD',
-    device_id: 'FDDB952641AA2826CE9E6B6159D9D5242B41F93A69288C342C3508764A3E3621',
-    device_id_2: 'FDDB952641AA2826CE9E6B6159D9D5242B41F93A69288C342C3508764A3E3621',
+    mac_address: '',
+    serial_number: '',
+    device_id: '',
+    device_id_2: '',
     stb_type: 'MAG250',
     api_signature: '263',
 };
